@@ -155,6 +155,12 @@ int64_t llama_time_us(void) {
 
 // returns true on success
 static bool llama_prepare_model_devices(const llama_model_params & params, llama_model * model) {
+    const bool has_layer_devices = params.layer_devices != nullptr && params.n_layer_devices > 0;
+    if (has_layer_devices && params.split_mode != LLAMA_SPLIT_MODE_LAYER) {
+        LLAMA_LOG_ERROR("%s: explicit layer devices require LLAMA_SPLIT_MODE_LAYER\n", __func__);
+        return false;
+    }
+
     // create list of devices to use with this model
     if (params.devices) {
         if (params.split_mode == LLAMA_SPLIT_MODE_TENSOR) {
@@ -180,6 +186,16 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
             for (ggml_backend_dev_t * dev = params.devices; *dev; ++dev) {
                 model->devices.push_back({false, *dev});
             }
+        }
+    } else if (has_layer_devices) {
+        for (size_t i = 0; i < params.n_layer_devices; ++i) {
+            auto * dev = params.layer_devices[i];
+            if (dev == nullptr || std::find_if(model->devices.begin(), model->devices.end(), [dev](const llama_device & item) {
+                return item.dev == dev;
+            }) != model->devices.end()) {
+                continue;
+            }
+            model->devices.push_back({false, dev});
         }
     } else {
         // default device selection
@@ -281,6 +297,18 @@ static bool llama_prepare_model_devices(const llama_model_params & params, llama
         // (RPC servers do not count, otherwise the local iGPU would be dropped on iGPU+RPC setups)
         if (gpus.empty()) {
             model->devices.insert(model->devices.end(), igpus.begin(), igpus.end());
+        }
+    }
+
+    if (has_layer_devices) {
+        for (size_t i = 0; i < params.n_layer_devices; ++i) {
+            auto * dev = params.layer_devices[i];
+            if (dev != nullptr && std::find_if(model->devices.begin(), model->devices.end(), [dev](const llama_device & item) {
+                return item.dev == dev;
+            }) == model->devices.end()) {
+                LLAMA_LOG_ERROR("%s: layer device %s is not in the device list\n", __func__, ggml_backend_dev_name(dev));
+                return false;
+            }
         }
     }
 
@@ -616,4 +644,3 @@ const char * llama_print_system_info(void) {
 
     return s.c_str();
 }
-

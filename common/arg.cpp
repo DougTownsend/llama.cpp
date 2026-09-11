@@ -1135,6 +1135,29 @@ static std::vector<ggml_backend_dev_t> parse_device_list(const std::string & val
     return devices;
 }
 
+static std::vector<ggml_backend_dev_t> parse_layer_device_list(const std::string & value) {
+    std::vector<ggml_backend_dev_t> devices;
+    const auto dev_names = string_split<std::string>(value, ',');
+    if (dev_names.empty()) {
+        throw std::invalid_argument("no layer devices specified");
+    }
+
+    ggml_backend_load_all();
+    for (const auto & device : dev_names) {
+        if (device == "none") {
+            devices.push_back(nullptr);
+            continue;
+        }
+
+        auto * dev = ggml_backend_dev_by_name(device.c_str());
+        if (!dev || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+            throw std::invalid_argument(string_format("invalid layer device: %s", device.c_str()));
+        }
+        devices.push_back(dev);
+    }
+    return devices;
+}
+
 void common_print_available_devices() {
     constexpr size_t MiB = 1024 * 1024;
     std::vector<ggml_backend_dev_t> devices;
@@ -2759,11 +2782,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
     add_opt(common_arg(
         {"-dev", "--device"}, "<dev1,dev2,..>",
         "comma-separated list of devices to use for offloading (none = don't offload)\n"
+        "devices are considered in list order by --fit (higher priority first)\n"
         "use --list-devices to see a list of available devices",
         [](common_params & params, const std::string & value) {
             params.devices = parse_device_list(value);
         }
     ).set_env("LLAMA_ARG_DEVICE"));
+    add_opt(common_arg(
+        {"--layer-devices", "--layer-device"}, "<dev0,dev1,..>",
+        "comma-separated list of devices for each model layer in layer order (none = CPU; output layer follows the last entry if omitted)\n"
+        "use --list-devices to see a list of available devices",
+        [](common_params & params, const std::string & value) {
+            params.layer_devices = parse_layer_device_list(value);
+        }
+    ).set_env("LLAMA_ARG_LAYER_DEVICES"));
     add_opt(common_arg(
         {"--list-devices"},
         "print list of available devices and exit",

@@ -8,6 +8,7 @@
 
 #include <cstdint>
 #include <map>
+#include <vector>
 
 // Reserve a new compute graph. It is valid until the next call to llama_graph_reserve.
 LLAMA_API struct ggml_cgraph * llama_graph_reserve(
@@ -87,6 +88,16 @@ LLAMA_API int32_t llama_model_n_expert (const struct llama_model * model);
 LLAMA_API int32_t llama_model_n_devices(const struct llama_model * model);
 
 LLAMA_API ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int i);
+
+struct llama_model_layer_memory {
+    int32_t layer;
+    size_t size;
+    ggml_backend_dev_t device;
+};
+
+using llama_model_layer_memory_vec = std::vector<llama_model_layer_memory>;
+
+LLAMA_API llama_model_layer_memory_vec llama_model_get_layer_memory(const struct llama_model * model);
 
 LLAMA_API llama_memory_breakdown llama_get_memory_breakdown(const struct llama_context * ctx);
 

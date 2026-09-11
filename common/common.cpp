@@ -1292,7 +1292,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
-    if (params.fit_params) {
+    if (params.fit_params && params.layer_devices.empty()) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
 
@@ -1682,6 +1682,10 @@ struct llama_model_params common_model_params_to_llama(common_params & params) {
 
     if (!params.devices.empty()) {
         mparams.devices = params.devices.data();
+    }
+    if (!params.layer_devices.empty()) {
+        mparams.layer_devices = params.layer_devices.data();
+        mparams.n_layer_devices = params.layer_devices.size();
     }
 
     mparams.n_gpu_layers    = params.n_gpu_layers;

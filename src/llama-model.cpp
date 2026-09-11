@@ -1163,6 +1163,9 @@ struct llama_model::impl {
         buft_list_t * buft_list;
     };
 
+    std::vector<std::vector<ggml_tensor *>> layer_tensors;
+    std::vector<ggml_backend_dev_t> layer_devices_owned;
+
     layer_dev dev_input = {};
     layer_dev dev_output = {};
     std::vector<layer_dev> dev_layer;
@@ -1178,6 +1181,11 @@ llama_model::llama_model(const llama_model_params & params) : params(params), pi
         // may need it later for tensor-parallel KV-cache split metadata.
         pimpl->tensor_split_owned.assign(params.tensor_split, params.tensor_split + llama_max_devices());
         this->params.tensor_split = pimpl->tensor_split_owned.data();
+    }
+    if (params.layer_devices != nullptr && params.n_layer_devices > 0) {
+        pimpl->layer_devices_owned.assign(params.layer_devices, params.layer_devices + params.n_layer_devices);
+        this->params.layer_devices = pimpl->layer_devices_owned.data();
+        this->params.n_layer_devices = pimpl->layer_devices_owned.size();
     }
     pimpl->has_tensor_overrides = params.tensor_buft_overrides && params.tensor_buft_overrides[0].pattern;
 }
@@ -1394,6 +1402,13 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     const int n_layer_all = hparams.n_layer_all;
     const int n_gpu_layers = this->n_gpu_layers();
+    const bool has_layer_devices = params.layer_devices != nullptr && params.n_layer_devices > 0;
+
+    if (has_layer_devices && params.n_layer_devices != (size_t) n_layer_all &&
+            params.n_layer_devices != (size_t) n_layer_all + 1) {
+        throw std::runtime_error(format("layer device list has %zu entries, expected %d or %d",
+            params.n_layer_devices, n_layer_all, n_layer_all + 1));
+    }
 
     const bool use_mmap_buffer = true;
 
@@ -1468,6 +1483,21 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     const int act_gpu_layers = devices.empty() ? 0 : std::min(n_gpu_layers, n_layer_all + 1);
     auto get_layer_buft_list = [&](int il) -> llama_model::impl::layer_dev {
         const bool is_swa = il < n_layer_all && hparams.is_swa(il);
+        if (has_layer_devices) {
+            const size_t layer_idx = std::min((size_t) il, params.n_layer_devices - 1);
+            auto * dev = params.layer_devices[layer_idx];
+            if (dev == nullptr) {
+                LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
+                return {cpu_dev, &pimpl->cpu_buft_list};
+            }
+            auto it = pimpl->gpu_buft_list.find(dev);
+            if (it == pimpl->gpu_buft_list.end()) {
+                throw std::runtime_error(format("layer %d is assigned to device %s, which is not available for the model",
+                    il, ggml_backend_dev_name(dev)));
+            }
+            LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
+            return {dev, &it->second};
+        }
         if (il < i_gpu_start || (il - i_gpu_start) >= act_gpu_layers) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
@@ -1484,6 +1514,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
     // assign the repeating layers to the devices according to the splits
     pimpl->dev_layer.resize(n_layer_all);
+    pimpl->layer_tensors.resize(n_layer_all + 1);
     for (int il = 0; il < n_layer_all; ++il) {
         pimpl->dev_layer[il] = get_layer_buft_list(il);
     }
@@ -1782,10 +1813,6 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
         }
         LLAMA_LOG_INFO("%s: offloading %d repeating layers to GPU\n", __func__, n_repeating);
 
-        const int max_backend_supported_layers = n_layer_all + 1;
-        const int max_offloadable_layers       = n_layer_all + 1;
-
-        LLAMA_LOG_INFO("%s: offloaded %d/%d layers to GPU\n", __func__, std::min(n_gpu_layers, max_offloadable_layers), max_backend_supported_layers);
     }
 
     // print memory requirements per buffer type
@@ -1818,9 +1845,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
     const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
-    return ml.create_tensor(
+    ggml_tensor * tensor = ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
+
+    if (tensor != nullptr) {
+        const llm_tensor_layer layer = llm_tensor_info_for(tn.tensor).layer;
+        if (layer == LLM_TENSOR_LAYER_REPEATING) {
+            pimpl->layer_tensors.at(tn.bid).push_back(tensor);
+        } else if (layer == LLM_TENSOR_LAYER_OUTPUT) {
+            pimpl->layer_tensors.back().push_back(tensor);
+        }
+    }
+
+    return tensor;
 }
 
 std::string llama_model::arch_name() const {
@@ -1857,6 +1895,16 @@ const float * llama_model::tensor_split() const {
 
 uint32_t llama_model::n_gpu_layers() const {
     // note: plus 1 for the "output" layer
+    if (!pimpl->layer_devices_owned.empty()) {
+        uint32_t n_gpu_layers = std::count_if(pimpl->layer_devices_owned.begin(), pimpl->layer_devices_owned.end(), [](ggml_backend_dev_t dev) {
+            return dev != nullptr;
+        });
+        if (pimpl->layer_devices_owned.size() == (size_t) hparams.n_layer_all &&
+                pimpl->layer_devices_owned.back() != nullptr) {
+            n_gpu_layers++;
+        }
+        return n_gpu_layers;
+    }
     return params.n_gpu_layers >= 0 ? params.n_gpu_layers : hparams.n_layer_all + 1;
 }
 
@@ -1880,6 +1928,27 @@ std::map<ggml_backend_buffer_type_t, size_t> llama_model::memory_breakdown() con
             }
         }
     }
+    return ret;
+}
+
+std::vector<std::pair<ggml_backend_dev_t, size_t>> llama_model::layer_memory() const {
+    std::vector<std::pair<ggml_backend_dev_t, size_t>> ret;
+    ret.reserve(pimpl->layer_tensors.size());
+
+    for (size_t i = 0; i < pimpl->layer_tensors.size(); ++i) {
+        const ggml_backend_dev_t dev = i == pimpl->dev_layer.size()
+            ? pimpl->dev_output.dev
+            : pimpl->dev_layer[i].dev;
+        size_t size = 0;
+        for (const ggml_tensor * tensor : pimpl->layer_tensors[i]) {
+            if (tensor->buffer != nullptr) {
+                size += GGML_PAD(ggml_backend_buffer_get_alloc_size(tensor->buffer, tensor),
+                                 ggml_backend_buffer_get_alignment(tensor->buffer));
+            }
+        }
+        ret.emplace_back(dev, size);
+    }
+
     return ret;
 }
 
@@ -2693,6 +2762,8 @@ llama_model_params llama_model_default_params() {
         /*.no_host                     =*/ false,
         /*.no_alloc                    =*/ false,
         /*.load_mtp                    =*/ false,
+        /*.layer_devices               =*/ nullptr,
+        /*.n_layer_devices             =*/ 0,
     };
 
     return result;
@@ -3116,6 +3187,16 @@ ggml_backend_dev_t llama_model_get_device(const struct llama_model * model, int 
         return nullptr;
     }
     return model->devices[i].dev;
+}
+
+llama_model_layer_memory_vec llama_model_get_layer_memory(const struct llama_model * model) {
+    llama_model_layer_memory_vec result;
+    const auto layers = model->layer_memory();
+    result.reserve(layers.size());
+    for (size_t i = 0; i < layers.size(); ++i) {
+        result.push_back({(int32_t) i, layers[i].second, layers[i].first});
+    }
+    return result;
 }
 
 //

@@ -347,6 +347,11 @@ extern "C" {
         bool no_host;         // bypass host buffer allowing extra buffers to be used
         bool no_alloc;        // only load metadata and simulate memory allocations
         bool load_mtp;        // whether to load MTP layers
+
+        // Optional device assignment for each layer, in layer order. A NULL entry assigns the layer to CPU.
+        // The array must contain either n_layer or n_layer + 1 entries; the last entry is used for the output layer when omitted.
+        const ggml_backend_dev_t * layer_devices;
+        size_t n_layer_devices;
     };
 
     struct llama_sampler_seq_config {

@@ -96,6 +96,30 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         }
     }
 
+    devs.clear();
+    for (int i = 0; i < llama_model_n_devices(model); i++) {
+        devs.push_back(llama_model_get_device(model, i));
+    }
+
+    // n_gpu_layers is interpreted relative to n_layer_all by the model loader,
+    // including NextN layers even when their tensors are not being loaded.
+    // Keep the fitter's layer count in the same coordinate system so that a
+    // disabled NextN layer does not shift a real repeating layer onto the CPU.
+    hp_ngl         = llama_model_n_layer(model) + llama_model_n_layer_nextn(model);
+    hp_n_ctx_train = llama_model_n_ctx_train(model);
+    hp_n_expert    = llama_model_n_expert(model);
+
+    common_memory_breakdown_print(ctx);
+
+    llama_free(ctx);
+    llama_model_free(model);
+    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
+
+    // Query the available memory only after destroying the temporary measurement model and
+    // context. Backend and scheduler instances can have real, unaccounted allocations even when
+    // model tensors and graph buffers are only being sized with no_alloc. Sampling while those
+    // instances are alive makes the fit budget depend on whether an otherwise-unused RPC device
+    // was included in the measurement.
     {
         ggml_backend_dev_t cpu_dev = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
         if (cpu_dev == nullptr) {
@@ -108,7 +132,7 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret.back().total = total;
     }
     for (size_t i = 0; i < nd; i++) {
-        ggml_backend_dev_t dev = llama_model_get_device(model, i);
+        ggml_backend_dev_t dev = devs[i];
 
         size_t free;
         size_t total;
@@ -130,24 +154,6 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         ret[i].free  = free;
         ret[i].total = total;
     }
-
-    devs.clear();
-    for (int i = 0; i < llama_model_n_devices(model); i++) {
-        devs.push_back(llama_model_get_device(model, i));
-    }
-
-    hp_ngl         = llama_model_n_layer(model);
-    if (mparams->load_mtp) {
-        hp_ngl    += llama_model_n_layer_nextn(model);
-    }
-    hp_n_ctx_train = llama_model_n_ctx_train(model);
-    hp_n_expert    = llama_model_n_expert(model);
-
-    common_memory_breakdown_print(ctx);
-
-    llama_free(ctx);
-    llama_model_free(model);
-    llama_log_set(ud.original_logger.callback, ud.original_logger.user_data);
 
     return ret;
 }
@@ -197,16 +203,21 @@ static void common_params_fit_impl(
     const bool     n_ctx_auto = cparams->n_ctx == 0;
 
     dmds_t   dmds_extra;       // memory of the extra model, laid out on the devices of the main model
-    uint32_t n_ctx_extra = 0;  // context that memory was measured at
+    uint32_t n_ctx_extra = 0;  // context that memory was measured at (cache key for independent extra models)
 
     // the extra model competes for the same memory as the main model, add it to every measurement
     // its memory is measured again whenever the context it follows changes
-    auto add_extra_memory = [&](dmds_t & dmds) {
+    auto add_extra_memory = [&](dmds_t & dmds, const llama_model_params & mparams_main) {
         if (extra == nullptr) {
             return;
         }
 
-        if (dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
+        // An MTP context shares the main model and therefore follows its exact layer placement. In
+        // particular, an otherwise-unused device must not receive part of the MTP estimate merely
+        // because it was present in the initial device list. Since the fitter changes the main
+        // placement for every candidate, shared-model memory has to be measured for every candidate
+        // too. Independent draft models only need to be remeasured when their context size changes.
+        if (extra->shares_model || dmds_extra.empty() || n_ctx_extra != cparams->n_ctx) {
             std::vector<ggml_backend_dev_t> devs_extra;
             uint32_t ngl_extra = 0;
             uint32_t nct_extra = 0;
@@ -219,8 +230,12 @@ static void common_params_fit_impl(
 
             dmds_t measured;
             try {
+                const llama_model_params * mparams_extra = extra->mparams;
+                if (extra->shares_model) {
+                    mparams_extra = &mparams_main;
+                }
                 measured = common_get_device_memory_data_impl(
-                    extra->path_model, extra->mparams, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
+                    extra->path_model, mparams_extra, extra->cparams, devs_extra, ngl_extra, nct_extra, nex_extra, log_level);
             } catch (const std::runtime_error & e) {
                 // the extra model is optional, fit the main model alone rather than giving up
                 LOG_WRN("%s: failed to measure the memory of the extra model, fitting without it: %s\n", __func__, e.what());
@@ -275,9 +290,22 @@ static void common_params_fit_impl(
             dmds_full = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
         }
     }
-    add_extra_memory(dmds_full);
+    add_extra_memory(dmds_full, *mparams);
 
     const size_t nd = devs.size(); // number of devices
+
+    bool tensor_split_unset = true;
+    if (mparams->tensor_split) {
+        for (size_t id = 0; id < nd; id++) {
+            if (mparams->tensor_split[id] != 0.0f) {
+                tensor_split_unset = false;
+                break;
+            }
+        }
+    }
+    const bool use_priority_fit = tensor_split_unset &&
+        mparams->n_gpu_layers == default_mparams.n_gpu_layers &&
+        mparams->split_mode == LLAMA_SPLIT_MODE_LAYER;
 
     std::vector<int64_t> margins; // this function uses int64_t rather than size_t for memory sizes to more conveniently handle deficits
     margins.reserve(nd);
@@ -362,9 +390,12 @@ static void common_params_fit_impl(
                     break;
                 }
             }
-            if (!changes_needed) {
+            if (!changes_needed && !use_priority_fit) {
                 LOG_TRC("%s: targets for free memory can be met on all devices, no changes needed\n", __func__);
                 return;
+            }
+            if (!changes_needed) {
+                LOG_TRC("%s: targets for free memory can be met on all devices, recomputing split in priority order\n", __func__);
             }
         }
     }
@@ -412,7 +443,7 @@ static void common_params_fit_impl(
                     int64_t sum_projected_used_min_ctx = 0;
                     cparams->n_ctx = n_ctx_min_total;
                     dmds_t dmds_min_ctx = common_get_device_memory_data_impl(path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-                    add_extra_memory(dmds_min_ctx);
+                    add_extra_memory(dmds_min_ctx, *mparams);
                     if (nd == 0) {
                         sum_projected_used_min_ctx = dmds_min_ctx.back().mb.total();
                     } else {
@@ -484,7 +515,7 @@ static void common_params_fit_impl(
         throw common_params_fit_exception("model_params::tensor_buft_overrides already set by user, abort");
     }
 
-    // step 3: iteratively fill the back to front with "dense" layers
+    // step 3: iteratively fill the devices in priority order with "dense" layers
     //   - for a dense model simply fill full layers, giving each device a contiguous slice of the model
     //   - for a MoE model, same as dense model but with all MoE tensors in system memory
 
@@ -584,6 +615,36 @@ static void common_params_fit_impl(
         mparams.tensor_buft_overrides = tensor_buft_overrides;
     };
 
+    // A trailing device with no layers is not actually part of a priority-ordered model split.
+    // Keeping it in model_params::devices nevertheless initializes its backend and includes it in
+    // graph scheduling, which can change context/compute memory estimates on the preceding devices.
+    // Return an explicitly terminated device list for exactly the devices used by this candidate.
+    auto get_used_devices = [&](const std::vector<ngl_t> & ngl_per_device) {
+        size_t n_used = 0;
+        for (size_t id = 0; id < nd; ++id) {
+            if (ngl_per_device[id].n_layer > 0) {
+                n_used = id + 1;
+            }
+        }
+
+        std::vector<ggml_backend_dev_t> result(devs.begin(), devs.begin() + n_used);
+        result.push_back(nullptr);
+        return result;
+    };
+
+    auto finalize_params = [&](
+            const std::vector<ngl_t> & ngl_per_device,
+            const std::vector<ggml_backend_buffer_type_t> & overflow_bufts) {
+        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+
+        // The caller-provided device array is null-terminated and writable. Truncate it in place so
+        // the real model uses the same devices as the final candidate that was measured above.
+        if (mparams->devices != nullptr) {
+            const auto used_devices = get_used_devices(ngl_per_device);
+            mparams->devices[used_devices.size() - 1] = nullptr;
+        }
+    };
+
     // utility function that returns the memory use per device for given numbers of layers per device
     auto get_memory_for_layers = [&](
             const char * func_name,
@@ -592,9 +653,27 @@ static void common_params_fit_impl(
         llama_model_params mparams_copy = *mparams;
         set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, mparams_copy);
 
-        dmds_t dmd_nl = common_get_device_memory_data_impl(
-            path_model, &mparams_copy, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-        add_extra_memory(dmd_nl);
+        // Measure only backends that own layers in this candidate. In particular, do not let an
+        // unused trailing RPC device alter scheduler buffers for an otherwise all-local split.
+        std::vector<ggml_backend_dev_t> used_devices = get_used_devices(ngl_per_device);
+        mparams_copy.devices = used_devices.data();
+
+        std::vector<ggml_backend_dev_t> devs_used;
+        dmds_t measured = common_get_device_memory_data_impl(
+            path_model, &mparams_copy, cparams, devs_used, hp_ngl, hp_nct, hp_nex, log_level);
+
+        // Expand the result back into the original device order used by the optimization state.
+        dmds_t dmd_nl(nd + 1);
+        dmd_nl.back() = measured.back();
+        for (size_t ju = 0; ju < devs_used.size(); ++ju) {
+            for (size_t id = 0; id < nd; ++id) {
+                if (devs_used[ju] == devs[id]) {
+                    dmd_nl[id] = measured[ju];
+                    break;
+                }
+            }
+        }
+        add_extra_memory(dmd_nl, mparams_copy);
 
         LOG_TRC("%s: memory for test allocation by device:\n", func_name);
         for (size_t id = 0; id < nd; id++) {
@@ -623,7 +702,7 @@ static void common_params_fit_impl(
         LOG_TRC("%s: getting device memory data with all MoE tensors moved to system memory:\n", __func__);
         dmds_t dmds_cpu_moe = common_get_device_memory_data_impl(
             path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
-        add_extra_memory(dmds_cpu_moe);
+        add_extra_memory(dmds_cpu_moe, *mparams);
 
         for (size_t id = 0; id < nd; id++) {
             global_surplus_cpu_moe += dmds_cpu_moe[id].free;
@@ -647,6 +726,9 @@ static void common_params_fit_impl(
     targets.reserve(nd);
     for (size_t id = 0; id < nd; id++) {
         targets.push_back(dmds_full[id].free - margins[id]);
+        LOG_INF("%s: %s fit budget: free=%" PRId64 " MiB, margin=%" PRId64 " MiB, max_used=%" PRId64 " MiB\n",
+                __func__, ggml_backend_dev_name(devs[id]), dmds_full[id].free/MiB,
+                margins[id]/MiB, targets[id]/MiB);
         LOG_TRC("%s: id=%zu, target=%" PRId64 " MiB\n", __func__, id, targets[id]/MiB);
     }
 
@@ -665,15 +747,15 @@ static void common_params_fit_impl(
     //   - interpolate the memory use / layer between low and high linearly to get a guess where it meets our target
     //   - check memory use of our guess, replace either the low or high bound
     //   - once we only have a difference of a single layer, stop and return the lower bound that just barely still fits
-    //   - the last device has the output layer, which cannot be a partial layer
+    //   - the last assigned device has the output layer, which cannot be a partial layer
     if (hp_nex == 0) {
-        LOG_TRC("%s: filling dense layers back-to-front:\n", __func__);
+        LOG_TRC("%s: filling dense layers in priority order:\n", __func__);
     } else {
-        LOG_TRC("%s: filling dense-only layers back-to-front:\n", __func__);
+        LOG_TRC("%s: filling dense-only layers in priority order:\n", __func__);
     }
-    for (int id = nd - 1; id >= 0; id--) {
+    for (size_t id = 0; id < nd; id++) {
         uint32_t n_unassigned = hp_ngl + 1;
-        for (size_t jd = id + 1; jd < nd; ++jd) {
+        for (size_t jd = 0; jd < id; ++jd) {
             assert(n_unassigned >= ngl_per_device[jd].n_layer);
             n_unassigned -= ngl_per_device[jd].n_layer;
         }
@@ -681,14 +763,23 @@ static void common_params_fit_impl(
         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
         ngl_per_device_high[id].n_layer = n_unassigned;
         if (hp_nex > 0) {
-            ngl_per_device_high[id].n_part = size_t(id) < nd - 1 ? ngl_per_device_high[id].n_layer : ngl_per_device_high[id].n_layer - 1;
+            if (ngl_per_device_high[id].n_layer > 0) {
+                ngl_per_device_high[id].n_part = ngl_per_device_high[id].n_layer - 1;
+                for (size_t jd = id; jd > 0; --jd) {
+                    const size_t output_owner = jd - 1;
+                    if (ngl_per_device_high[output_owner].n_layer > 0) {
+                        ngl_per_device_high[output_owner].n_part = ngl_per_device_high[output_owner].n_layer;
+                        break;
+                    }
+                }
+            }
         }
         if (ngl_per_device_high[id].n_layer > 0) {
             std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
             if (mem_high[id] > targets[id]) {
                 assert(ngl_per_device_high[id].n_layer > ngl_per_device[id].n_layer);
                 uint32_t delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
-                LOG_TRC("%s: start filling device %" PRIu32 ", delta=%" PRIu32 "\n", __func__, id, delta);
+                LOG_TRC("%s: start filling device %zu, delta=%" PRIu32 "\n", __func__, id, delta);
                 while (delta > 1) {
                     uint32_t step_size = int64_t(delta) * (targets[id] - mem[id]) / (mem_high[id] - mem[id]);
                     step_size = std::max(step_size, uint32_t(1));
@@ -697,19 +788,26 @@ static void common_params_fit_impl(
                     std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
                     ngl_per_device_test[id].n_layer += step_size;
                     if (hp_nex) {
-                        ngl_per_device_test[id].n_part += size_t(id) == nd - 1 && ngl_per_device_test[id].n_part == 0 ?
+                        ngl_per_device_test[id].n_part += ngl_per_device_test[id].n_part == 0 ?
                             step_size - 1 : step_size; // the first layer is the output layer which must always be full
+                        for (size_t jd = id; jd > 0; --jd) {
+                            const size_t output_owner = jd - 1;
+                            if (ngl_per_device_test[output_owner].n_layer > 0) {
+                                ngl_per_device_test[output_owner].n_part = ngl_per_device_test[output_owner].n_layer;
+                                break;
+                            }
+                        }
                     }
                     const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
                     if (mem_test[id] <= targets[id]) {
                         ngl_per_device = ngl_per_device_test;
                         mem            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+                        LOG_TRC("%s: set ngl_per_device[%zu].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
                     } else {
                         ngl_per_device_high = ngl_per_device_test;
                         mem_high            = mem_test;
-                        LOG_TRC("%s: set ngl_per_device_high[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
+                        LOG_TRC("%s: set ngl_per_device_high[%zu].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device_high[id].n_layer);
                     }
                     delta = ngl_per_device_high[id].n_layer - ngl_per_device[id].n_layer;
                 }
@@ -717,7 +815,7 @@ static void common_params_fit_impl(
                 assert(ngl_per_device_high[id].n_layer == n_unassigned);
                 ngl_per_device = ngl_per_device_high;
                 mem            = mem_high;
-                LOG_TRC("%s: set ngl_per_device[%d].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
+                LOG_TRC("%s: set ngl_per_device[%zu].n_layer=%" PRIu32 "\n", __func__, id, ngl_per_device[id].n_layer);
             }
         }
 
@@ -727,35 +825,36 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, mem[id]/MiB, projected_margin/MiB);
     }
     if (hp_nex == 0 || global_surplus_cpu_moe <= 0) {
-        set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+        finalize_params(ngl_per_device, overflow_bufts);
         return;
     }
 
     // step 4: for a MoE model where all dense tensors fit,
-    //     convert the dense-only layers in the back to full layers in the front until all devices are full
-    // essentially the same procedure as for the dense-only layers except front-to-back
+    //     convert dense-only layers on lower priority devices to full layers on higher priority devices
+    // essentially the same procedure as for the dense-only layers, in priority order
     // also, try fitting at least part of one more layer to reduce waste for "small" GPUs with e.g. 24 GiB VRAM
 
-    size_t id_dense_start = nd;
-    for (int id = nd - 1; id >= 0; id--) {
+    size_t id_dense_last = nd;
+    for (size_t id = 0; id < nd; id++) {
         if (ngl_per_device[id].n_layer > 0) {
-            id_dense_start = id;
-            continue;
+            id_dense_last = id;
         }
-        break;
     }
-    assert(id_dense_start < nd);
+    if (id_dense_last == nd) {
+        finalize_params(ngl_per_device, overflow_bufts);
+        return;
+    }
 
-    LOG_TRC("%s: converting dense-only layers to full layers and filling them front-to-back with overflow to next device/system memory:\n", __func__);
-    for (size_t id = 0; id <= id_dense_start && id_dense_start < nd; id++) {
+    LOG_TRC("%s: converting dense-only layers to full layers in priority order with overflow to next device/system memory:\n", __func__);
+    for (size_t id = 0; id <= id_dense_last; id++) {
         std::vector<ngl_t> ngl_per_device_high = ngl_per_device;
-        for (size_t jd = id_dense_start; jd < nd; jd++) {
-            const uint32_t n_layer_move = jd < nd - 1 ? ngl_per_device_high[jd].n_layer : ngl_per_device_high[jd].n_layer - 1;
+        for (size_t jd = id + 1; jd <= id_dense_last; jd++) {
+            const uint32_t n_layer_move = jd < id_dense_last ?
+                ngl_per_device_high[jd].n_layer : ngl_per_device_high[jd].n_layer - 1;
             ngl_per_device_high[id].n_layer += n_layer_move;
             ngl_per_device_high[jd].n_layer -= n_layer_move;
             ngl_per_device_high[jd].n_part = 0;
         }
-        size_t id_dense_start_high = nd - 1;
         std::vector<int64_t> mem_high = get_memory_for_layers(__func__, ngl_per_device_high, overflow_bufts);
 
         if (mem_high[id] > targets[id]) {
@@ -767,33 +866,26 @@ static void common_params_fit_impl(
                 step_size = std::min(step_size, delta - 1);
 
                 std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
-                size_t id_dense_start_test = id_dense_start;
                 uint32_t n_converted_test = 0;
-                for (;id_dense_start_test < nd; id_dense_start_test++) {
-                    const uint32_t n_convert_jd = std::min(step_size - n_converted_test, ngl_per_device_test[id_dense_start_test].n_part);
-                    ngl_per_device_test[id_dense_start_test].n_layer -= n_convert_jd;
-                    ngl_per_device_test[id_dense_start_test].n_part -= n_convert_jd;
+                for (size_t jd = id + 1; jd <= id_dense_last && n_converted_test < step_size; jd++) {
+                    const uint32_t n_convert_jd = std::min(step_size - n_converted_test, ngl_per_device_test[jd].n_part);
+                    ngl_per_device_test[jd].n_layer -= n_convert_jd;
+                    ngl_per_device_test[jd].n_part -= n_convert_jd;
                     ngl_per_device_test[id].n_layer += n_convert_jd;
                     n_converted_test += n_convert_jd;
-
-                    if (ngl_per_device_test[id_dense_start_test].n_part > 0) {
-                        break;
-                    }
                 }
                 const std::vector<int64_t> mem_test = get_memory_for_layers(__func__, ngl_per_device_test, overflow_bufts);
 
                 if (mem_test[id] <= targets[id]) {
                     ngl_per_device = ngl_per_device_test;
                     mem            = mem_test;
-                    id_dense_start = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
-                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), source=%zu\n",
+                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id + 1);
                 } else {
                     ngl_per_device_high = ngl_per_device_test;
                     mem_high            = mem_test;
-                    id_dense_start_high = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device_high[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start_high=%zu\n",
-                        __func__, id, ngl_per_device_high[id].n_layer, ngl_per_device_high[id].n_part, id_dense_start_high);
+                    LOG_TRC("%s: set ngl_per_device_high[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 ")\n",
+                        __func__, id, ngl_per_device_high[id].n_layer, ngl_per_device_high[id].n_part);
                 }
                 assert(ngl_per_device_high[id].n_full() >= ngl_per_device[id].n_full());
                 delta = ngl_per_device_high[id].n_full() - ngl_per_device[id].n_full();
@@ -801,22 +893,24 @@ static void common_params_fit_impl(
         } else {
             ngl_per_device = ngl_per_device_high;
             mem            = mem_high;
-            id_dense_start = id_dense_start_high;
-            LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 "), id_dense_start=%zu\n",
-                __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+            LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part)=(%" PRIu32 ", %" PRIu32 ")\n",
+                __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part);
         }
 
         // try to fit at least part of one more layer
-        if (ngl_per_device[id_dense_start].n_layer > (id < nd - 1 ? 0 : 1)) {
+        size_t id_dense_source = nd;
+        for (size_t jd = id + 1; jd <= id_dense_last; jd++) {
+            if (ngl_per_device[jd].n_part > 0) {
+                id_dense_source = jd;
+                break;
+            }
+        }
+        if (id_dense_source < nd && ngl_per_device[id_dense_source].n_layer > (id_dense_source == id_dense_last ? 1 : 0)) {
             std::vector<ngl_t> ngl_per_device_test = ngl_per_device;
-            size_t id_dense_start_test = id_dense_start;
-            ngl_per_device_test[id_dense_start_test].n_layer--;
-            ngl_per_device_test[id_dense_start_test].n_part--;
+            ngl_per_device_test[id_dense_source].n_layer--;
+            ngl_per_device_test[id_dense_source].n_part--;
             ngl_per_device_test[id].n_layer++;
             ngl_per_device_test[id].n_part++;
-            if (ngl_per_device_test[id_dense_start_test].n_part == 0) {
-                id_dense_start_test++;
-            }
             ngl_per_device_test[id].overflow_type = LAYER_FRACTION_UP;
             std::vector<ggml_backend_buffer_type_t> overflow_bufts_test = overflow_bufts;
             if (id < nd - 1) {
@@ -828,9 +922,8 @@ static void common_params_fit_impl(
                 ngl_per_device = ngl_per_device_test;
                 overflow_bufts = overflow_bufts_test;
                 mem            = mem_test;
-                id_dense_start = id_dense_start_test;
-                LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", UP), id_dense_start=%zu\n",
-                    __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", UP), source=%zu\n",
+                    __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_source);
 
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_GATE;
                 LOG_TRC("%s: trying to fit one extra layer with overflow_type=LAYER_FRACTION_GATE\n", __func__);
@@ -839,9 +932,8 @@ static void common_params_fit_impl(
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
-                    id_dense_start = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), id_dense_start=%zu\n",
-                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", GATE), source=%zu\n",
+                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_source);
                 }
             } else {
                 ngl_per_device_test[id].overflow_type = LAYER_FRACTION_ATTN;
@@ -851,9 +943,8 @@ static void common_params_fit_impl(
                     ngl_per_device = ngl_per_device_test;
                     overflow_bufts = overflow_bufts_test;
                     mem            = mem_test;
-                    id_dense_start = id_dense_start_test;
-                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), id_dense_start=%zu\n",
-                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_start);
+                    LOG_TRC("%s: set ngl_per_device[%zu].(n_layer, n_part, overflow_type)=(%" PRIu32 ", %" PRIu32 ", ATTN), source=%zu\n",
+                        __func__, id, ngl_per_device[id].n_layer, ngl_per_device[id].n_part, id_dense_source);
                 }
             }
         }
@@ -864,15 +955,7 @@ static void common_params_fit_impl(
             __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
     }
 
-    // print info for devices that were not changed during the conversion from dense only to full layers:
-    for (size_t id = id_dense_start + 1; id < nd; id++) {
-        const int64_t projected_margin = dmds_full[id].free - mem[id];
-        LOG_TRC(
-            "%s:   - %s: %2" PRIu32 " layers (%2" PRIu32 " overflowing), %6" PRId64 " MiB used, %6" PRId64 " MiB free\n",
-            __func__, dev_names[id].c_str(), ngl_per_device[id].n_layer, ngl_per_device[id].n_part, mem[id]/MiB, projected_margin/MiB);
-    }
-
-    set_ngl_tensor_split_tbo(ngl_per_device, overflow_bufts, *mparams);
+    finalize_params(ngl_per_device, overflow_bufts);
 }
 
 enum common_params_fit_status common_fit_params(

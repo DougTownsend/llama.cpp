@@ -433,6 +433,8 @@ MTMD_API mtmd_input_chunks * mtmd_test_create_input_chunks(void);
 MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(
     const char * mmproj_fname,
     struct mtmd_context_params ctx_params);
+MTMD_API std::map<ggml_backend_dev_t, size_t> mtmd_get_memory_usage(
+    const struct mtmd_context * ctx);
 #endif
 
 //

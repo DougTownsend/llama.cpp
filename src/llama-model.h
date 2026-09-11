@@ -730,6 +730,8 @@ struct llama_model {
 
     std::map<ggml_backend_buffer_type_t, size_t> memory_breakdown() const;
 
+    std::vector<std::pair<ggml_backend_dev_t, size_t>> layer_memory() const;
+
     // total number of parameters in the model
     uint64_t n_elements() const;
 

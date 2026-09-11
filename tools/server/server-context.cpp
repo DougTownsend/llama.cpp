@@ -16,6 +16,7 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#include "../../src/llama-ext.h"
 
 #include <algorithm>
 #include <cstddef>
@@ -1073,14 +1074,42 @@ private:
                 SRV_TRC("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
                 GGML_ASSERT(!params_base.fit_params_target.empty());
                 for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
-                            if (i < params_base.fit_params_target.size()) {
-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                                params_base.fit_params_target[i] += size;
+                    // fit_params_target is indexed by the model's --device order, not by the
+                    // global backend registry. In particular, the CPU backend can have index 0
+                    // in the registry even though it is not present in the model device list.
+                    // Using the registry index made a CPU mmproj increase the margin for the
+                    // first GPU and changed the layer split.
+                    if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        SRV_DBG("[mtmd] mmproj uses %.2f MiB of host memory; no device fit target changed\n",
+                                size / (1024.0 * 1024.0));
+                        continue;
+                    }
+
+                    size_t fit_device = params_base.fit_params_target.size();
+                    if (!params_base.devices.empty()) {
+                        for (size_t i = 0; i < params_base.devices.size() && params_base.devices[i] != nullptr; ++i) {
+                            if (params_base.devices[i] == dev) {
+                                fit_device = i;
+                                break;
                             }
-                            break;
                         }
+                    } else {
+                        // Preserve the default-device behavior when --device was not specified.
+                        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                            if (ggml_backend_dev_get(i) == dev) {
+                                fit_device = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (fit_device < params_base.fit_params_target.size()) {
+                        SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target[%zu] for device %s\n",
+                                size / (1024.0 * 1024.0), fit_device, ggml_backend_dev_name(dev));
+                        params_base.fit_params_target[fit_device] += size;
+                    } else {
+                        SRV_DBG("[mtmd] mmproj device %s is not in the model device list; no device fit target changed\n",
+                                ggml_backend_dev_name(dev));
                     }
                 }
             } else {
@@ -1109,6 +1138,17 @@ private:
         if (ctx_tgt == nullptr) {
             SRV_ERR("failed to create_context with model '%s'\n", params_base.model.path.c_str());
             return false;
+        }
+
+        const auto layer_memory = llama_model_get_layer_memory(model_tgt);
+        const int n_layers = (int) layer_memory.size();
+        const int n_gpu_layers = (int) std::count_if(layer_memory.begin(), layer_memory.end(), [](const auto & layer) {
+            return layer.device != nullptr && ggml_backend_dev_type(layer.device) != GGML_BACKEND_DEVICE_TYPE_CPU;
+        });
+        SRV_INF("offloaded %d/%d layers to non-CPU devices\n", n_gpu_layers, n_layers);
+        for (const auto & layer : layer_memory) {
+            SRV_INF("layer %d: size = %.2f MiB, device = %s\n", layer.layer,
+                    layer.size / (1024.0 * 1024.0), ggml_backend_dev_name(layer.device));
         }
 
         vocab = llama_model_get_vocab(model_tgt);
@@ -1165,6 +1205,10 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            for (auto & [dev, size] : mtmd_get_memory_usage(mctx)) {
+                SRV_INF("mmproj: size = %.2f MiB, device = %s\n",
+                        size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+            }
 
             init_opt.video_params.fps_target = params_base.video_fps;
             init_opt.video_params.timestamp_interval_ms = params_base.video_timestamp_interval_ms;
